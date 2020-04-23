@@ -1,0 +1,182 @@
+#!/usr/bin/ruby -Ws
+#like samhain and satan 
+
+require 'set'
+
+class FileX 
+  attr_accessor :stat
+  attr_accessor :name
+
+  def initialize name
+    @stat = File::lstat(name) 
+    @name = name
+  end
+
+  def directory?
+    @stat.directory?
+  end
+
+  def file?
+    @stat.file?
+  end
+
+  def link?
+    @stat.symlink?
+  end
+
+  def type
+    @stat.ftype 
+  end
+end 
+
+#recurse fs performing &proc on each file
+def recurse dir, &proc
+    Dir::entries(dir).sort.each do |e|
+        next if e == "." 
+        next if e == ".." 
+
+        e = e.force_encoding("utf-8")
+
+        if dir == "/"
+          e = "/" + e
+        else 
+          e = dir + "/" + e
+        end
+    
+        if $excl.include?(e)
+          next 
+        end
+
+        f = FileX::new(e)
+
+        begin
+          if f.file?
+            yield(f)
+          elsif f.link?
+            yield(f)
+          elsif f.directory?
+            recurse(e,&proc)
+          elsif f.type == "socket"
+          else
+            puts "wtf: " + f.name  + " : " + f.type
+          end
+        rescue Interrupt => ex
+          $stderr.puts "interrupted"
+          exit!(-2)
+        rescue Exception => ex
+          $stderr.puts "error processing %s: %s" % [e,ex]
+          raise ex
+        end
+    end
+end
+
+
+def get_stat f
+  "%s %o %8d %s %3d/%3d" % [f.stat.ftype, f.stat.mode, f.stat.size, f.stat.mtime, f.stat.uid, f.stat.gid]
+end 
+
+
+def read_stats
+  stats = {}
+  unless File::exists?($data) 
+    $stderr.puts "data file not found\ntry: muckolla -u"
+    exit(-1)
+  end
+  IO::foreach($data, :encoding => "utf-8") do |l|
+    l =~ /(.+)\t(.+)/
+    unless $&
+      $stderr.puts "error in #{$data}: '#{l.chomp}'"
+      next
+    end
+    stats[$2] = $1
+  end
+  return stats
+end
+
+# main #
+
+if defined? $h
+  $stderr.puts DATA.readlines
+  $stderr.puts "switches: "
+  $stderr.puts " -u   update"
+  $stderr.puts " -r   show reason for change"
+  $stderr.puts " -h   this"
+  exit(-1)
+end
+
+if ENV['USER'] == "root" or not ENV.has_key?('USER')
+  $root = "/"
+else 
+  $root = ENV['HOME'] 
+end
+
+puts "user: " + ENV['USER']
+puts "root: " + $root
+
+$data = ENV['HOME'] + '/.muckolla.dat'
+puts "data: " + $data
+
+$excl = Set.new
+$excl.add("/dev")
+$excl.add("/proc")
+$excl.add("/run")
+$excl.add("/sys")
+$excl.add("/tmp")
+$excl.add("/var")
+
+excl_file = ENV['HOME'] + '/.muckolla.excl'
+if File::exists?(excl_file) 
+  puts "excl_file: " + excl_file 
+  IO::foreach(excl_file) do |l|
+    l.chomp!
+    $excl.add(l) if 1<l.length
+  end
+end
+puts "excl: #{$excl.inspect}" 
+
+
+if $u
+  c = 0
+  io = File::new($data, File::WRONLY|File::CREAT|File::TRUNC, 0600, :encoding => "utf-8")
+
+  recurse($root) do |f| 
+    stat = get_stat(f)
+    io.puts(stat + "\t" + f.name)
+    c = c.next
+  end 
+
+  io.close
+  $stderr.puts c.to_s + " entries written to " + $data
+
+else
+  stats = read_stats()
+
+  recurse($root) do |f| 
+    old_stat = stats.delete(f.name)
+
+    unless old_stat
+      puts "+ " + f.name
+      next
+    end
+
+    new_stat = get_stat(f)
+
+    if new_stat != old_stat
+      puts "* " + f.name
+      puts "  old:%s\n  new:%s" % [old_stat, new_stat] if $r
+    end
+  end 
+
+  stats.keys.sort.each do |f|
+    puts "- " + f
+  end
+
+end
+
+
+__END__
+Muck Olla
+
+Another fable is about an ancient Celtic Druid practice. On Halloween, groups of peasents would go from house to house, asking for money to buy food for the feast; and demanding fatted calves and black sheep be prepared for the occasion. These "contributions" were requested in the name of Muck Olla, a Druid deity. Prosperity was promised to all who were generous donors, and tricks to all who refused by casting a spell on you or hurting you. Then, at the feast itself, the ghosts, that were thought to throng all around were greeted with a banquet table. At the end of the feast, the masked and costumed villagers, representing the souls of the dead paraded to the outskirts of town leading the ghosts away. 
+".... the Druids in Ireland would go through the neighborhoods and countryside on the eve of October 31st to collect offerings to Satan. They would carry lanterns, bags of money, and canes with very sharp points on the ends ( currently known as leprechaun staffs, good luck horns, or fairies' wands ). At each house, they would demand a specific amount. If the household would not or could not give the offering ( penance or treat ), the Druid would use the cane to castrate the male human or one of their prize animals." 
+

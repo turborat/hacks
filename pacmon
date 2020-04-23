@@ -1,0 +1,588 @@
+#!/usr/bin/ruby -W
+
+require 'curses'
+require 'monitor'
+require 'resolv'
+require 'ipaddr'
+
+if ENV['USER'] != 'root'
+  printf $stderr, "you are not a real rasta\n"
+  exit(-1)
+end
+
+$last_txt_len = 0
+def flash_txt str
+  return if $pause
+  str = str.to_s
+  $mon.synchronize do 
+    Curses::standout
+    Curses::setpos(Curses::lines-1,0)
+    Curses::addstr("%-#{$last_txt_len}s" % str)
+    $last_txt_len = str.length
+    Curses::standend
+    Curses::setpos(Curses::lines-1,Curses::cols-1)
+    Curses::refresh
+  end 
+end
+
+def scale_num value, base
+  fp = Float(value) / base 
+  if fp < 10 
+    ret = "%1.1f" % fp 
+    ret.gsub!(".0", "") if ret =~ /^10.0/
+    return ret  
+  else 
+    return fp.floor.to_s
+  end
+end
+
+def mag_fmt value
+  if value == 0 
+    return '-' 
+  elsif value > 1_000_000_000
+    return scale_num(value, 1_000_000_000) + "g"
+  elsif value > 1_000_000
+    return scale_num(value, 1_000_000) + "m"
+  elsif value > 1_000
+    return scale_num(value, 1_000) + "k"
+  else 
+    return value.to_s + "b"
+  end
+end
+
+def trim_addr(str,n)
+  if str.length < n
+    return str
+  else 
+    return "##" + str.reverse[0..(n-4)].reverse
+  end
+end
+
+$name_cache = Hash::new
+
+def resolve(ip) 
+  name = $name_cache[ip]
+  if name.nil?
+    begin
+      name = Resolv.getname(ip)
+    rescue Resolv::ResolvError => e
+      unless e.to_s.include?("no name")
+        raise "!resolv: #{e}" 
+      end
+      name = ip
+    end
+    $name_cache[ip] = name
+  end
+  return name
+end
+
+def pct_fmt(pct) 
+  raise "!#{pct}" if pct > 1
+  pct = pct * 100.0
+  if pct == 0
+    return "-"
+  elsif pct < 0.1
+    return "~0%"
+  elsif pct < 1
+    return ".%d%%"  % (pct * 10) 
+  elsif pct == 100
+    return "***"
+  else
+    return "%2d%%" % pct
+  end
+end
+
+def fmt_elapsed(now, time_last) 
+  elapsed = now - time_last 
+  if elapsed < 1 
+    return "." 
+  elsif elapsed < 100 
+    return "%ds" % elapsed
+  elsif elapsed < 60*60
+    return "%dm" % (elapsed/60) 
+  else 
+    return "%dh" % (elapsed/60/60)
+  end
+end
+
+class Packet
+  attr_accessor :src_host
+  attr_accessor :src_port
+  attr_accessor :dst_host
+  attr_accessor :dst_port
+  attr_accessor :outgoing
+  attr_accessor :foreign
+  attr_accessor :proc
+  attr_accessor :len
+
+  def initialize line 
+    @line = line 
+
+    matches = /(\S+)\.(\d+) > (\S+)\.(\d+)[\s:]/.match(line)
+
+    if matches.nil? 
+      raise "?: #{line}"
+    end
+
+    @src_ip = matches[1]
+    @src_host = resolve(@src_ip)
+    @src_port = matches[2]
+
+    @dst_ip = matches[3]
+    @dst_host = resolve(@dst_ip)
+    @dst_port = matches[4]
+
+    if line =~ /length (\d+)/
+      @len = $1.to_i
+    elsif line =~ /\((\d+)\)$/ # udp #
+      @len = $1.to_i
+    else
+      flash_txt("?len: #{line}<")
+      @len = 0
+    end
+
+    if @src_host == HOSTNAME
+      @outgoing = true 
+      @foreign = false
+    elsif @dst_host == HOSTNAME
+      @outgoing = false 
+      @foreign = false
+    elsif IPAddr::new(@src_ip).to_i & NETMASK == SUBNET
+      @outgoing = true 
+      @foreign = true
+    elsif IPAddr::new(@dst_ip).to_i & NETMASK == SUBNET
+      @outgoing = false 
+      @foreign = true
+    end
+
+    @proc = @line =~ /pid ([^\.]+)\.\d+/ ? $1.downcase : nil
+  end
+
+  def remote_ip 
+    return @outgoing ? @dst_ip : @src_ip
+  end 
+
+  def local_ip 
+    return @outgoing ? @src_ip : @dst_ip
+  end 
+
+  def remote_host 
+    return @outgoing ? @dst_host : @src_host
+  end 
+
+  def local_host 
+    return @outgoing ? @src_host : @dst_host
+  end 
+
+  def label
+    if @outgoing
+      return [@src_port, @dst_host, @dst_port].join(":")
+    else 
+      return [@dst_port, @src_host, @src_port].join(":")
+    end
+  end
+end
+
+class PacketStream
+  attr_accessor :label
+  attr_accessor :proc
+  attr_accessor :bytes_sent
+  attr_accessor :bytes_sent_last
+  attr_accessor :bytes_recv
+  attr_accessor :bytes_recv_last
+  attr_accessor :local_port
+  attr_accessor :local_ip
+  attr_accessor :local_host
+  attr_accessor :local_service
+  attr_accessor :remote_port
+  attr_accessor :remote_host
+  attr_accessor :remote_ip
+  attr_accessor :remote_service
+  attr_accessor :cc
+  attr_accessor :time_last
+  attr_accessor :foreign
+
+  def initialize pac_info
+    if pac_info.outgoing
+      @local_port  = pac_info.src_port
+      @remote_host = pac_info.dst_host
+      @remote_port = pac_info.dst_port
+    else
+      @local_port  = pac_info.dst_port
+      @remote_host = pac_info.src_host
+      @remote_port = pac_info.src_port
+    end
+
+    @label = pac_info.label()
+    @proc = nil
+    @bytes_sent = 0
+    @bytes_sent_last = 0
+    @bytes_recv = 0
+    @bytes_recv_last = 0
+    @local_ip = pac_info.local_ip()
+    @local_host = pac_info.local_host()
+    @remote_ip = pac_info.remote_ip()
+    @cc = nil
+    @time_last = 0
+
+    @remote_service = $services[ @remote_port ] 
+    if @remote_service.nil? 
+      @remote_service = @remote_port 
+    end
+
+    @local_service = $services[ @local_port ] 
+    if @local_service.nil? 
+      @local_service = @local_port 
+    end
+
+    @foreign = pac_info.foreign
+  end
+
+  def tally(pac_info)
+    if pac_info.outgoing
+      @bytes_sent      += pac_info.len
+      @bytes_sent_last += pac_info.len
+    else
+      @bytes_recv      += pac_info.len
+      @bytes_recv_last += pac_info.len
+    end
+
+    @time_last = Time::now.to_i
+
+    if @proc.nil? 
+      @proc = pac_info.proc
+    elsif @proc != pac_info.proc && !pac_info.proc.nil?
+      flash_txt(">#{@proc}<!>#{pac_info.proc}<")
+      @proc = pac_info.proc
+    end
+
+
+#flash_txt("drop: {pac_info}")
+
+#    die '!' unless @foreign    == pac_info.foreign
+#    die '!' unless @local_ip   == pac_info.local_ip
+#    die '!' unless @local_host == pac_info.local_host
+#    die '!' unless @remote_ip  == pac_info.remote_ip
+  end
+
+  def bytes 
+    return @bytes_sent + @bytes_recv
+  end
+
+  def bytes_last
+    return @bytes_sent_last + @bytes_recv_last
+  end
+
+  def clear_last 
+    @bytes_sent_last = 0
+    @bytes_recv_last = 0
+  end
+end
+
+
+class Scoreboard 
+  attr_accessor :streams
+
+  def initialize
+    @streams = Hash::new
+    reset()
+  end
+
+  def reset
+    @start = Time::now
+    @streams.clear
+    @total_bytes_sent = 0
+    @total_bytes_recv = 0 
+    @total_bytes_sent_last = 0
+    @total_bytes_recv_last = 0 
+    @bytes_dropped = 0
+  end
+
+  def clear_last 
+    @total_bytes_sent_last = 0
+    @total_bytes_recv_last = 0 
+  end
+
+  def parse line
+    return if line.strip == ""
+
+    pac_info = Packet::new(line)
+
+    if pac_info.outgoing.nil? 
+      @bytes_dropped += pac_info.len
+      flash_txt("drop: (#{mag_fmt(@bytes_dropped)}) #{line}")
+      return 
+    end
+
+    stream = @streams[ pac_info.label() ]
+
+    if stream.nil?
+      stream = PacketStream::new(pac_info)
+      @streams.store(pac_info.label(), stream)
+    end
+
+    stream.tally(pac_info)
+
+    if pac_info.outgoing
+      @total_bytes_sent      += pac_info.len
+      @total_bytes_sent_last += pac_info.len
+    else
+      @total_bytes_recv      += pac_info.len
+      @total_bytes_recv_last += pac_info.len
+    end
+  end
+
+  def total_bytes 
+    return @total_bytes_sent + @total_bytes_recv
+  end
+
+  def total_bytes_last 
+    return @total_bytes_sent_last + @total_bytes_recv_last
+  end
+
+  def print_header
+    Curses::setpos(0,0)
+    Curses::standout
+
+    titles = ("             >> %6s (%4s)         << %6s (%4s)     age cc" % [
+      @total_bytes_sent_last > 0 ? mag_fmt(@total_bytes_sent_last / $period) + "/s" : "-",
+      mag_fmt(@total_bytes_sent),
+      @total_bytes_recv_last > 0 ? mag_fmt(@total_bytes_recv_last / $period) + "/s" : "-",
+      mag_fmt(@total_bytes_recv),
+    ]) 
+
+    Curses::addstr(titles)
+    time = Time::now::strftime("%H:%M:%S")
+    Curses::addstr("%#{Curses::cols - titles.length}s" % time) 
+    Curses::standend
+  end
+
+  def fmt_bytes(bytes, bytes_last, total_bytes_last) 
+    return "%6s (%4s) %3s " % [
+      bytes_last > 0 ? mag_fmt(bytes_last / $period) + "/s" : "-",
+      mag_fmt(bytes),
+      total_bytes_last > 0 ? pct_fmt(Float(bytes_last) / total_bytes_last) : "-"
+    ]
+  end
+
+  def draw
+    if @streams.values.empty? 
+      flash_txt "wait"
+      return
+    end
+
+    sorted_streams = @streams.values.sort { |a,b| 
+      ret = 0
+      ret = b.bytes_last() <=> a.bytes_last() if ret == 0 
+      ret = b.time_last    <=> a.time_last    if ret == 0 
+      ret = b.bytes()      <=> a.bytes()      if ret == 0 
+      ret
+    }
+
+    high = Curses::lines - 2 
+    max = (sorted_streams.size > high) ? high : sorted_streams.size
+
+    Curses::clear
+
+    print_header()
+
+    now = Time::now.to_i
+
+    (0..max-1).each do |i|
+      stream = sorted_streams[i]
+
+      lhs = ""
+      
+      if(stream.foreign) 
+        lhs += "%-15s " % "[#{stream.local_host}]"
+      else
+        lhs += "%-8s " % [ stream.proc.nil? ? "-" : stream.proc[0..7] ]
+        lhs += ":%-5s " % stream.local_service
+      end
+
+      lhs += fmt_bytes(stream.bytes_sent, stream.bytes_sent_last, @total_bytes_sent_last)
+
+      lhs += ":%-5s " % stream.remote_service
+      lhs += fmt_bytes(stream.bytes_recv, stream.bytes_recv_last, @total_bytes_recv_last)
+
+      if stream.bytes_last() > 0
+        lhs += "  . "
+      else
+        lhs += ("%3s " % [ fmt_elapsed(now, stream.time_last) ])
+      end
+
+      lhs += ("%2s " % [ stream.cc.nil? ? "-" : stream.cc ])
+
+      Curses::addstr(lhs)
+
+      addr = trim_addr(stream.remote_host, Curses::cols - lhs.length + 1) 
+      Curses::addstr("%#{Curses::cols - lhs.length}s" % addr) 
+    end
+
+    clear_last()
+    @streams.values.each do |stream|
+      stream.clear_last()
+    end
+    
+    Curses::setpos(Curses::lines-1,0)
+    Curses::standout 
+    footer = "[ip:#{IP}] [netmask:#{NETMASK.to_s(16)}] [subnet:#{SUBNET}] [if:#{IF}] [#{HOSTNAME}]" 
+    Curses::addstr("%#{Curses::cols - 1}s" % footer)
+    Curses::refresh
+    Curses::standend
+  end 
+end
+
+def die(e)
+  Curses::close_screen
+  $stderr.puts "fatal: #{e::class}: #{e}\n"
+  $stderr.puts e.backtrace unless e.is_a? String 
+  exit(-1) 
+end
+
+if ARGV.empty? 
+    printf $stderr, "missing arg (if)\n"
+    exit(-1) 
+end
+
+IF = ARGV[0]
+
+die("netmask?") unless `ifconfig #{IF}` =~ /netmask (0x.{8})\s/
+NETMASK = $1.to_i(16)  
+
+die("ip?")      unless `ifconfig #{IF}` =~ /inet ([^\s]+)\s/
+IP = IPAddr::new($1)
+
+SUBNET = IP & NETMASK
+
+HOSTNAME = `hostname`.chomp
+$period = 3 
+$pause = false 
+
+$mon = Monitor::new
+Thread::abort_on_exception = true 
+Curses::init_screen
+$services = Hash::new
+sb = Scoreboard::new
+
+IO::foreach("/etc/services") do |line|
+  if line =~ /^(\w+)\s+(\d+)\// 
+    $services[ $2 ] = $1[0..4]
+  end
+  $services[ "53" ] = "dns" 
+end
+
+#thread listening for keystrokes
+Thread::fork do 
+  while true do 
+    chr = $stdin.getc
+
+    if chr == 'q'
+      flash_txt "und .... tchuss"
+      $mon.synchronize do 
+        sleep(1)
+      end
+      Curses::close_screen
+      exit(0)
+    elsif chr == 'r'
+      flash_txt "reset"
+      $mon.synchronize do 
+        sleep(1)
+      end
+      sb.reset
+      Curses::clear
+    elsif chr == 'h'
+      flash_txt "keys: r:reset space:pause c:copyright q:quit"
+      $mon.synchronize do 
+        sleep(2)
+      end
+    elsif chr == 'c'
+      flash_txt 'pacmon copyright 2004 wario'
+    elsif '1' <= chr && chr <= '9'
+      n = chr.to_i
+      $period = n
+      flash_txt "period = #{n}"
+    elsif chr == ' '
+      if !$pause
+        flash_txt("pause")
+      end
+      $pause = !$pause
+      if !$pause
+        flash_txt("resume")
+      end
+    else
+      flash_txt "wtf" 
+    end
+  end
+end
+
+Thread::fork do 
+  seen = Hash::new
+  while true do 
+    sb.streams.values.each do |stream|
+      if stream.cc.nil? 
+        cc = seen[ stream.remote_ip ]
+        unless cc.nil? 
+          $mon.synchronize do 
+            stream.cc = cc 
+          end 
+        else
+          out = `echo #{stream.remote_ip} | geoip -i cc 2>&1`
+          if out =~ /\[(\S\S)\]/
+            cc = $1
+            cc = "?" if cc == "??"
+
+            $mon.synchronize do 
+              stream.cc = cc
+            end 
+            seen[ stream.remote_ip ] = cc
+
+            #so we don't have to wait, er..
+            sb.streams.values.each do |s2|
+              if s2.cc.nil?
+                cc = seen[ s2.remote_ip ] 
+                unless cc.nil?
+                  $mon.synchronize do 
+                    s2.cc = cc
+                  end 
+                end
+              end
+            end 
+          end
+        end
+      end
+    end
+    sleep 1 
+  end 
+end
+
+#thread to update our scoreboard
+Thread::fork do
+  io = IO::popen("tcpdump ip or udp and not icmp and not igmp -n -l --immediate-mode -k -i #{IF} 2>/dev/null")
+  while true do
+    line = io.readline
+    $mon.synchronize do 
+      begin
+        sb.parse(line)
+      rescue Exception => e
+        $stderr.puts "line: #{line}\n"
+        die(e)
+      end
+    end 
+  end
+end
+
+while true do 
+  unless $pause
+    $mon.synchronize do 
+      begin
+        sb.draw()
+      rescue Exception => e
+        die(e)
+      end
+    end 
+  end 
+  sleep($period)
+end
+
+# $Id: pacmon,v 1.19 2004/04/06 09:51:07 wario Exp wario $
